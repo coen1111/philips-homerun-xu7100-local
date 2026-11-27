@@ -365,7 +365,12 @@ class BaseBackend:
 
     # ---- commands ---------------------------------------------------------
     @_with_job_lock
-    def start(self):    self._command("start")
+    def start(self):
+        # Start on a paused run carries on with it, like the robot's own button;
+        # a new job only starts from the dock or idle.
+        if self.state().get("state") == "paused":
+            return self.resume()
+        self._command("start")
     def pause(self):    self._command("pause")
     def stop(self):     self._command("stop")
     def home(self):     self._command("home")
@@ -606,6 +611,14 @@ class BaseBackend:
 class TuyaBackend(BaseBackend):
     source = "robot"
 
+    # When the robot stops answering: open a fresh connection after RECONNECT_AFTER
+    # seconds, and after REDISCOVER_AFTER look for it on the subnet (its DHCP
+    # address may have changed), at most once every REDISCOVER_EVERY seconds.
+    RECONNECT_AFTER = 30
+    REDISCOVER_AFTER = 120
+    REDISCOVER_EVERY = 600
+    PORT = 6668
+
     def __init__(self, cfg):
         super().__init__()
         import sys
@@ -613,12 +626,97 @@ class TuyaBackend(BaseBackend):
         import tinytuya
         self._tt = tinytuya
         self.cfg = cfg
-        self.dev = tinytuya.Device(
-            cfg["device_id"], cfg.get("ip", "192.168.3.241"), cfg["local_key"],
-            version=float(cfg.get("version", 3.3)),
-        )
+        self._down_since = None
+        self._last_reconnect = 0.0
+        self._last_rediscover = 0.0
+        self._connect(cfg.get("ip", "192.168.3.241"), float(cfg.get("version", 3.3)))
+
+    def _connect(self, ip, version):
+        self.dev = self._tt.Device(self.cfg["device_id"], ip, self.cfg["local_key"], version=version)
         self.dev.set_socketPersistent(True)
         self.dev.set_socketTimeout(6)
+        self.cfg["ip"], self.cfg["version"] = ip, version
+
+    def _close(self):
+        try:
+            self.dev.close()
+        except Exception:
+            pass
+
+    def _recover(self):
+        """Called on every poll without an answer: reconnect, then rediscover."""
+        now = time.time()
+        if self._down_since is None:
+            self._down_since = now
+            return
+        down = now - self._down_since
+        if down >= self.RECONNECT_AFTER:
+            with self._lock:
+                self.connected = False
+        if down >= self.REDISCOVER_AFTER and now - self._last_rediscover >= self.REDISCOVER_EVERY:
+            self._last_rediscover = now
+            found = self._rediscover()
+            if found:
+                self._connect(*found)
+                self._down_since = now
+                return
+        if down >= self.RECONNECT_AFTER and now - self._last_reconnect >= self.RECONNECT_AFTER:
+            self._last_reconnect = now
+            self._close()
+            self._connect(self.cfg["ip"], float(self.cfg.get("version", 3.3)))
+
+    def _rediscover(self):
+        """Find the robot on the /24 of its configured address.
+
+        Only hosts with the Tuya LAN port open get a status request, encrypted with
+        this robot's key; another device can't answer it, so an answer is the robot.
+        The robot takes one LAN connection at a time, so ours is closed first."""
+        import ipaddress
+        import socket
+        from concurrent.futures import ThreadPoolExecutor
+        old = self.cfg.get("ip")
+        try:
+            net = ipaddress.ip_network(f"{old}/24", strict=False)
+        except ValueError:
+            return None
+        self._close()
+
+        def port_open(host):
+            s = socket.socket()
+            s.settimeout(0.5)
+            try:
+                s.connect((str(host), self.PORT))
+                return str(host)
+            except OSError:
+                return None
+            finally:
+                s.close()
+
+        with ThreadPoolExecutor(32) as ex:
+            hosts = [h for h in ex.map(port_open, net.hosts()) if h]
+        mine = float(self.cfg.get("version", 3.5))
+        versions = [mine] + [v for v in (3.5, 3.4, 3.3) if v != mine]
+        for host in sorted(hosts, key=lambda h: h != old):
+            for v in versions:
+                d = self._tt.Device(self.cfg["device_id"], host, self.cfg["local_key"], version=v)
+                d.set_socketTimeout(4)
+                try:
+                    r = d.status()
+                except Exception:
+                    r = None
+                finally:
+                    try:
+                        d.close()
+                    except Exception:
+                        pass
+                if isinstance(r, dict) and isinstance(r.get("dps"), dict):
+                    if host != old:
+                        print(f"[controller] robot found at {host} (Tuya {v}), it was at {old}: "
+                              "give it a fixed address in the router and the app options", flush=True)
+                    return host, v
+        print(f"[controller] robot not found on {net} (Tuya port open on: "
+              f"{', '.join(hosts) or 'none'})", flush=True)
+        return None
 
     def refresh(self):
         # status() returns the NEXT message on the persistent socket. The robot
@@ -626,7 +724,10 @@ class TuyaBackend(BaseBackend):
         # one message per poll falls further and further behind: the app showed
         # "charging, 73%" while the robot was at 83% and off the dock. Drain
         # everything queued after the query and apply it in arrival order.
-        msgs = [self.dev.status()]
+        try:
+            msgs = [self.dev.status()]
+        except Exception as e:   # a dead socket must still count as no answer
+            msgs = [{"Error": str(e)}]
         self.dev.set_socketTimeout(0.4)
         try:
             for _ in range(100):
@@ -651,8 +752,11 @@ class TuyaBackend(BaseBackend):
             with self._lock:
                 self._last_update = time.time()
                 self.connected = True
-        elif isinstance(msgs[0], dict) and msgs[0].get("Error"):
-            self.connected = False
+            self._down_since = None
+        else:
+            if isinstance(msgs[0], dict) and msgs[0].get("Error"):
+                self.connected = False
+            self._recover()
         return self.raw()
 
     def _command(self, action):

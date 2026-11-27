@@ -96,6 +96,7 @@ class HomeRunFloorSelect(HomeRunEntity, SelectEntity):
 
     _attr_translation_key = "floor"
     _attr_icon = "mdi:floor-plan"
+    _requires_robot = False   # the floors come from the cloud
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator: HomeRunCoordinator, entry: HomeRunConfigEntry) -> None:

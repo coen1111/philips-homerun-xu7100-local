@@ -28,6 +28,8 @@ async def async_setup_entry(
 class HomeRunMapCamera(HomeRunEntity, Camera):
     """Fetches GET /api/map so the robot's map shows up in Home Assistant."""
 
+    _requires_robot = False   # the stored map comes from the cloud
+
     _attr_translation_key = "map"
     _attr_content_type = "image/png"
 
